@@ -6,6 +6,7 @@ use crate::encoder::{CopyTo, Encoder};
 use anyhow::bail;
 use brotlic::{BlockSize, CompressionMode, CompressorWriter, Quality, WindowSize};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use lz4::liblz4::BlockChecksum;
 use std::cmp::min;
 use std::ffi::OsStr;
 use std::fs::File;
@@ -122,11 +123,17 @@ impl Encoding {
             Self::Lz4 { level } => Box::new(
                 lz4::EncoderBuilder::new()
                     .favor_dec_speed(true)
+                    .block_checksum(BlockChecksum::NoBlockChecksum)
                     .level(*level)
                     .build(output)?,
             ),
             Self::Zstd { level, dict } => match &dict {
-                Some(dict) => Box::new(zstd::Encoder::with_prepared_dictionary(output, &dict)?),
+                Some(dict) => {
+                    let mut encoder = zstd::Encoder::with_prepared_dictionary(output, &dict)?;
+                    encoder.include_checksum(false)?;
+                    encoder.long_distance_matching(false)?;
+                    Box::new(encoder)
+                }
                 None => Box::new(zstd::Encoder::new(output, *level)?),
             },
             Self::Brotli { level } => {
@@ -148,7 +155,9 @@ impl Decoding {
         Ok(match self {
             Self::Lz4 => Box::new(lz4::Decoder::new(input)?),
             Self::Zstd { dict, .. } => match &dict {
-                Some(dict) => Box::new(zstd::Decoder::with_prepared_dictionary(input, &dict)?),
+                Some(dict) => {
+                    Box::new(zstd::Decoder::with_prepared_dictionary(input, &dict)?.single_frame())
+                }
                 None => Box::new(zstd::Decoder::new(input)?),
             },
             Self::Brotli => Box::new(brotlic::DecompressorReader::new(input)),
