@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.90"
+brotlic = "0.8.2"
 clap = { version = "4", features = ["derive"] }
 lz4 = "1.28.0"
 zstd = { version = "0.13", features = ["experimental"] }

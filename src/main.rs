@@ -4,6 +4,7 @@ mod encoder;
 use crate::decoder::{CopyFrom, Decoder};
 use crate::encoder::{CopyTo, Encoder};
 use anyhow::bail;
+use brotlic::{BlockSize, CompressionMode, CompressorWriter, Quality, WindowSize};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::cmp::min;
 use std::ffi::OsStr;
@@ -68,6 +69,7 @@ enum Algorithm {
     Copy,
     Lz4,
     Zstd,
+    Brotli,
 }
 
 impl Algorithm {
@@ -76,6 +78,7 @@ impl Algorithm {
             Algorithm::Copy => "bak",
             Algorithm::Zstd => "zstd",
             Algorithm::Lz4 => "lz4",
+            Algorithm::Brotli => "br",
         }
     }
 
@@ -84,6 +87,7 @@ impl Algorithm {
             Some("bak") => Some(Self::Copy),
             Some("zstd") => Some(Self::Zstd),
             Some("lz4") => Some(Self::Lz4),
+            Some("br") => Some(Self::Brotli),
             _ => None,
         }
     }
@@ -97,6 +101,9 @@ enum Encoding {
         level: i32,
         dict: Option<EncoderDictionary<'static>>,
     },
+    Brotli {
+        level: u8,
+    },
     Copy,
 }
 
@@ -105,23 +112,33 @@ enum Decoding {
     Zstd {
         dict: Option<DecoderDictionary<'static>>,
     },
+    Brotli,
     Copy,
 }
 
 impl Encoding {
-    fn new_encoder<'a, W: Write + 'a>(&self, output: W) -> io::Result<Box<dyn Encoder + 'a>> {
+    fn new_encoder<'a, W: Write + 'a>(&self, output: W) -> anyhow::Result<Box<dyn Encoder + 'a>> {
         Ok(match self {
-            Encoding::Lz4 { level } => Box::new(
+            Self::Lz4 { level } => Box::new(
                 lz4::EncoderBuilder::new()
                     .favor_dec_speed(true)
                     .level(*level)
                     .build(output)?,
             ),
-            Encoding::Zstd { level, dict } => match &dict {
+            Self::Zstd { level, dict } => match &dict {
                 Some(dict) => Box::new(zstd::Encoder::with_prepared_dictionary(output, &dict)?),
                 None => Box::new(zstd::Encoder::new(output, *level)?),
             },
-            Encoding::Copy => Box::new(CopyTo::new(output)),
+            Self::Brotli { level } => {
+                let encoder = brotlic::BrotliEncoderOptions::new()
+                    .quality(Quality::new(*level)?)
+                    .window_size(WindowSize::new(16)?)
+                    .block_size(BlockSize::new(16)?)
+                    .mode(CompressionMode::Generic)
+                    .build()?;
+                Box::new(CompressorWriter::with_encoder(encoder, output))
+            }
+            Self::Copy => Box::new(CopyTo::new(output)),
         })
     }
 }
@@ -129,11 +146,12 @@ impl Encoding {
 impl Decoding {
     fn new_decoder<'a, R: BufRead + 'a>(&self, input: R) -> io::Result<Box<dyn Decoder + 'a>> {
         Ok(match self {
-            Self::Lz4 { .. } => Box::new(lz4::Decoder::new(input)?),
+            Self::Lz4 => Box::new(lz4::Decoder::new(input)?),
             Self::Zstd { dict, .. } => match &dict {
                 Some(dict) => Box::new(zstd::Decoder::with_prepared_dictionary(input, &dict)?),
                 None => Box::new(zstd::Decoder::new(input)?),
             },
+            Self::Brotli => Box::new(brotlic::DecompressorReader::new(input)),
             Self::Copy => Box::new(CopyFrom::new(input)),
         })
     }
@@ -274,6 +292,7 @@ fn decoding(dict: Option<&Vec<u8>>, algorithm: Algorithm) -> Decoding {
     let decoding = match algorithm {
         Algorithm::Copy => Decoding::Copy,
         Algorithm::Lz4 => Decoding::Lz4,
+        Algorithm::Brotli => Decoding::Brotli,
         Algorithm::Zstd => Decoding::Zstd {
             dict: dict.map(|d| DecoderDictionary::copy(d)),
         },
@@ -290,6 +309,9 @@ fn encoding(dict: Option<&Vec<u8>>, algorithm: Algorithm, compression: i32) -> E
         Algorithm::Zstd => Encoding::Zstd {
             level: compression,
             dict: dict.map(|d| EncoderDictionary::copy(d, compression)),
+        },
+        Algorithm::Brotli => Encoding::Brotli {
+            level: compression.try_into().unwrap_or_default(),
         },
     };
     encoding
@@ -312,7 +334,7 @@ fn compress<R: Read + Seek, W: Write + Seek>(
     output: W,
     chunk_size: u64,
     compression: &Encoding,
-) -> io::Result<Measurement> {
+) -> anyhow::Result<Measurement> {
     let input = BufReader::new(input);
     let output = BufWriter::new(output);
     measure(input, output, |mut i, mut o| {
@@ -325,7 +347,7 @@ fn compress_chunk<R: BufRead, W: Write + Seek>(
     output: W,
     chunk_size: u64,
     compression: &Encoding,
-) -> io::Result<u64> {
+) -> anyhow::Result<u64> {
     let mut encoder = compression.new_encoder(output)?;
     let mut remaining = chunk_size;
     let mut total_read = 0;
@@ -350,7 +372,7 @@ fn decompress<R: Read + Seek, W: Write + Seek>(
     input: R,
     output: W,
     decoding: &Decoding,
-) -> io::Result<Measurement> {
+) -> anyhow::Result<Measurement> {
     let input = BufReader::new(input);
     let output = BufWriter::new(output);
     measure(input, output, |mut i, mut o| {
@@ -362,7 +384,7 @@ fn decompress_chunk<R: BufRead, W: Write + Seek>(
     mut input: R,
     mut output: W,
     decoding: &Decoding,
-) -> io::Result<u64> {
+) -> anyhow::Result<u64> {
     if input.fill_buf()?.is_empty() {
         return Ok(0);
     }
@@ -384,8 +406,8 @@ fn decompress_chunk<R: BufRead, W: Write + Seek>(
 fn measure<I: Seek, O: Seek, T>(
     mut input: I,
     mut output: O,
-    process: impl Fn(&mut I, &mut O) -> io::Result<T>,
-) -> io::Result<Measurement> {
+    process: impl Fn(&mut I, &mut O) -> anyhow::Result<T>,
+) -> anyhow::Result<Measurement> {
     let start_time = Instant::now();
     process(&mut input, &mut output)?;
     let end_time = Instant::now();
