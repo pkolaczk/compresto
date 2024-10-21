@@ -230,6 +230,9 @@ fn run(cmd: Config) -> anyhow::Result<()> {
         }) => {
             let encoding = encoding(dict.as_ref(), *algorithm, *compression);
             let decoding = decoding(dict.as_ref(), *algorithm);
+            let mut buffered_input = Vec::new();
+            input.read_to_end(&mut buffered_input)?;
+            let mut input = Cursor::new(buffered_input);
             let mut output = Cursor::new(Vec::<u8>::new());
             let c_perf = compress(&mut input, &mut output, *chunk_size, &encoding)?;
             output.rewind()?;
