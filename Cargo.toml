@@ -1,0 +1,9 @@
+[package]
+name = "zcompress"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+lz4 = "1.28.0"
+zstd = { version = "0.13", features = ["experimental"] }
