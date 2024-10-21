@@ -3,22 +3,53 @@ mod encoder;
 
 use crate::decoder::{CopyFrom, Decoder};
 use crate::encoder::{CopyTo, Encoder};
-use clap::{Parser, ValueEnum};
+use anyhow::bail;
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::cmp::min;
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
-use std::io::{BufRead, BufReader, BufWriter, Error, Read, Seek, Write};
+use std::io::{BufRead, BufReader, BufWriter, Cursor, Error, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::exit;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use zstd::dict::{DecoderDictionary, EncoderDictionary};
 
 #[derive(Parser)]
-struct Command {
+struct Config {
+    #[command(subcommand)]
+    command: Command,
+
     /// Input file path
-    #[clap()]
+    #[arg()]
     path: PathBuf,
 
+    /// Path to a dictionary file
+    #[arg(long, short = 'd')]
+    dict: Option<PathBuf>,
+
+    /// Length of the dictionary prefix to use
+    #[arg(long, default_value = "16384")]
+    dict_len: u64,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Compress a file
+    Compress(CompressionCfg),
+    /// Decompress a file
+    Decompress {
+        /// Compression algorithm. If not given, determined automatically from the file extension.
+        #[clap(long, short = 'a')]
+        algorithm: Option<Algorithm>,
+    },
+
+    /// Benchmark compression+decompression of a single run
+    Benchmark(CompressionCfg),
+}
+
+#[derive(Args)]
+struct CompressionCfg {
     /// Compression algorithm
     #[clap(long, short = 'a', default_value = "zstd")]
     algorithm: Algorithm,
@@ -30,18 +61,6 @@ struct Command {
     /// Size of a file chunk in bytes. Each chunk is compressed independently.
     #[clap(long, short = 'b', default_value = "16384")]
     chunk_size: u64,
-
-    /// Path to a dictionary file
-    #[clap(long, short = 'd')]
-    dict: Option<PathBuf>,
-
-    /// Length of the dictionary prefix to use
-    #[clap(long, default_value = "16384")]
-    dict_len: u64,
-
-    /// Decompress instead of compressing
-    #[clap(short = 'x', required = false)]
-    extract: bool,
 }
 
 #[derive(ValueEnum, Copy, Clone)]
@@ -57,6 +76,15 @@ impl Algorithm {
             Algorithm::Copy => "bak",
             Algorithm::Zstd => "zstd",
             Algorithm::Lz4 => "lz4",
+        }
+    }
+
+    fn from_file_name(path: &Path) -> Option<Algorithm> {
+        match path.extension().and_then(OsStr::to_str) {
+            Some("bak") => Some(Self::Copy),
+            Some("zstd") => Some(Self::Zstd),
+            Some("lz4") => Some(Self::Lz4),
+            _ => None,
         }
     }
 }
@@ -111,44 +139,119 @@ impl Decoding {
     }
 }
 
-struct Summary {
+struct Measurement {
     input_len: u64,
     output_len: u64,
-    throughput_bps: u64,
+    elapsed: Duration,
 }
 
-fn main() {
-    let cmd = Command::parse();
-    match run(cmd) {
-        Ok(summary) => {
-            eprintln!(
-                "{} => {} ({:.1}%) {:.1} MB/s",
-                summary.input_len,
-                summary.output_len,
-                (summary.output_len as f32) / (summary.input_len as f32) * 100.0,
-                summary.throughput_bps as f64 / 1000000.0
-            )
-        }
-        Err(e) => {
-            eprintln!("error: {}", e);
-            exit(1);
-        }
+impl Measurement {
+    fn compression_ratio(&self) -> f64 {
+        self.output_len as f64 / self.input_len as f64
+    }
+
+    fn input_throughtput(&self) -> f64 {
+        self.input_len as f64 / self.elapsed.as_secs_f64()
+    }
+
+    fn output_throughtput(&self) -> f64 {
+        self.output_len as f64 / self.elapsed.as_secs_f64()
+    }
+
+    fn format_compression(&self) -> String {
+        format!(
+            "{} => {} ({:.1} %)",
+            self.input_len,
+            self.output_len,
+            self.compression_ratio() * 100.0
+        )
     }
 }
 
-fn run(cmd: Command) -> io::Result<Summary> {
-    let input = File::open(&cmd.path).map_err(|e| {
+fn main() {
+    let cmd = Config::parse();
+    if let Err(e) = run(cmd) {
+        eprintln!("error: {}", e);
+        exit(1);
+    }
+}
+
+fn run(cmd: Config) -> anyhow::Result<()> {
+    let mut input = File::open(&cmd.path).map_err(|e| {
         Error::new(
             e.kind(),
             format!("Could not open file {}: {}", cmd.path.display(), e),
         )
     })?;
 
-    let extension_suffix = if cmd.extract {
-        "x"
-    } else {
-        cmd.algorithm.extension()
+    let dict = match &cmd.dict {
+        None => None,
+        Some(path) => Some(load_dictionary(&path, cmd.dict_len).map_err(|e| {
+            Error::new(
+                e.kind(),
+                format!("Failed to load dictionary {}: {}", path.display(), e),
+            )
+        })?),
     };
+
+    match &cmd.command {
+        Command::Decompress { algorithm } => {
+            let Some(algorithm) = algorithm.and_then(|_| Algorithm::from_file_name(&cmd.path))
+            else {
+                bail!("Cannot determine compression algorithm from the extension. Please use -a/--algorithm option.");
+            };
+            let decoding = decoding(dict.as_ref(), algorithm);
+            let output = open_output(&cmd)?;
+            let result = decompress(input, output, &decoding)?;
+            eprintln!(
+                "{}, {:.1} MB/s",
+                result.format_compression(),
+                result.output_throughtput() / 1_000_000.0
+            );
+        }
+        Command::Compress(CompressionCfg {
+            algorithm,
+            compression,
+            chunk_size,
+        }) => {
+            let encoding = encoding(dict.as_ref(), *algorithm, *compression);
+            let output = open_output(&cmd)?;
+            let result = compress(input, output, *chunk_size, &encoding)?;
+            eprintln!(
+                "{}, {:.1} MB/s",
+                result.format_compression(),
+                result.input_throughtput() / 1_000_000.0
+            );
+        }
+        Command::Benchmark(CompressionCfg {
+            algorithm,
+            compression,
+            chunk_size,
+        }) => {
+            let encoding = encoding(dict.as_ref(), *algorithm, *compression);
+            let decoding = decoding(dict.as_ref(), *algorithm);
+            let mut output = Cursor::new(Vec::<u8>::new());
+            let c_perf = compress(&mut input, &mut output, *chunk_size, &encoding)?;
+            output.rewind()?;
+            let d_perf = decompress(output, Cursor::new(Vec::<u8>::new()), &decoding)?;
+            println!(
+                "{}, compression: {:.1} MB/s, decompression: {:.1} MB/s",
+                c_perf.format_compression(),
+                c_perf.input_throughtput() / 1_000_000.0,
+                d_perf.output_throughtput() / 1_000_000.0
+            );
+        }
+    }
+    Ok(())
+}
+
+fn open_output(cmd: &Config) -> Result<File, Error> {
+    let extension_suffix = match &cmd.command {
+        Command::Compress(CompressionCfg { algorithm, .. }) => algorithm.extension(),
+        Command::Decompress { .. } => "",
+        Command::Benchmark(_) => "",
+    };
+
     let new_extension = match cmd.path.extension() {
         None => extension_suffix.to_owned(),
         Some(ext) => format!("{}.{}", ext.to_string_lossy(), extension_suffix),
@@ -161,49 +264,32 @@ fn run(cmd: Command) -> io::Result<Summary> {
             format!("Could not create file {}: {}", output_path.display(), e),
         )
     })?;
+    Ok(output)
+}
 
-    let dict = match cmd.dict {
-        None => None,
-        Some(path) => Some(load_dictionary(&path, cmd.dict_len).map_err(|e| {
-            Error::new(
-                e.kind(),
-                format!("Failed to load dictionary {}: {}", path.display(), e),
-            )
-        })?),
+fn decoding(dict: Option<&Vec<u8>>, algorithm: Algorithm) -> Decoding {
+    let decoding = match algorithm {
+        Algorithm::Copy => Decoding::Copy,
+        Algorithm::Lz4 => Decoding::Lz4,
+        Algorithm::Zstd => Decoding::Zstd {
+            dict: dict.map(|d| DecoderDictionary::copy(d)),
+        },
     };
+    decoding
+}
 
-    let start_time = Instant::now();
-    let (orig_size, out_size) = if cmd.extract {
-        let decoding = match cmd.algorithm {
-            Algorithm::Copy => Decoding::Copy,
-            Algorithm::Lz4 => Decoding::Lz4,
-            Algorithm::Zstd => Decoding::Zstd {
-                dict: dict.map(|d| DecoderDictionary::copy(&d)),
-            },
-        };
-        decompress(input, output, &decoding)?
-    } else {
-        let encoding = match cmd.algorithm {
-            Algorithm::Copy => Encoding::Copy,
-            Algorithm::Lz4 => Encoding::Lz4 {
-                level: cmd.compression.try_into().unwrap_or_default(),
-            },
-            Algorithm::Zstd => Encoding::Zstd {
-                level: cmd.compression,
-                dict: dict.map(|d| EncoderDictionary::copy(&d, cmd.compression)),
-            },
-        };
-        compress(input, output, cmd.chunk_size, &encoding)?
+fn encoding(dict: Option<&Vec<u8>>, algorithm: Algorithm, compression: i32) -> Encoding {
+    let encoding = match algorithm {
+        Algorithm::Copy => Encoding::Copy,
+        Algorithm::Lz4 => Encoding::Lz4 {
+            level: compression.try_into().unwrap_or_default(),
+        },
+        Algorithm::Zstd => Encoding::Zstd {
+            level: compression,
+            dict: dict.map(|d| EncoderDictionary::copy(d, compression)),
+        },
     };
-
-    let end_time = Instant::now();
-    let elapsed = end_time - start_time;
-    let throughput_bps = (orig_size as f64 / elapsed.as_secs_f64()) as u64;
-    Ok(Summary {
-        input_len: orig_size,
-        output_len: out_size,
-        throughput_bps,
-    })
+    encoding
 }
 
 fn load_dictionary(path: &Path, len: u64) -> io::Result<Vec<u8>> {
@@ -218,24 +304,22 @@ fn load_dictionary(path: &Path, len: u64) -> io::Result<Vec<u8>> {
     Ok(data)
 }
 
-fn compress(
-    input: File,
-    output: File,
+fn compress<R: Read + Seek, W: Write + Seek>(
+    input: R,
+    output: W,
     chunk_size: u64,
     compression: &Encoding,
-) -> io::Result<(u64, u64)> {
-    let mut input = BufReader::new(input);
-    let mut output = BufWriter::new(output);
-    while compress_chunk(&mut input, &mut output, chunk_size, compression)? == chunk_size {}
-
-    let orig_size = input.stream_position()?;
-    let compressed_size = output.stream_position()?;
-    Ok((orig_size, compressed_size))
+) -> io::Result<Measurement> {
+    let input = BufReader::new(input);
+    let output = BufWriter::new(output);
+    measure(input, output, |mut i, mut o| {
+        Ok(while compress_chunk(&mut i, &mut o, chunk_size, compression)? == chunk_size {})
+    })
 }
 
-fn compress_chunk(
-    input: &mut BufReader<File>,
-    output: &mut BufWriter<File>,
+fn compress_chunk<R: BufRead, W: Write + Seek>(
+    mut input: R,
+    output: W,
     chunk_size: u64,
     compression: &Encoding,
 ) -> io::Result<u64> {
@@ -259,19 +343,21 @@ fn compress_chunk(
     Ok(total_read)
 }
 
-fn decompress(input: File, output: File, decoding: &Decoding) -> io::Result<(u64, u64)> {
-    let mut input = BufReader::new(input);
-    let mut output = BufWriter::new(output);
-    while decompress_chunk(&mut input, &mut output, decoding)? > 0 {}
-
-    let orig_size = input.stream_position()?;
-    let decompressed_size = output.stream_position()?;
-    Ok((orig_size, decompressed_size))
+fn decompress<R: Read + Seek, W: Write + Seek>(
+    input: R,
+    output: W,
+    decoding: &Decoding,
+) -> io::Result<Measurement> {
+    let input = BufReader::new(input);
+    let output = BufWriter::new(output);
+    measure(input, output, |mut i, mut o| {
+        Ok(while decompress_chunk(&mut i, &mut o, decoding)? > 0 {})
+    })
 }
 
-fn decompress_chunk(
-    input: &mut BufReader<File>,
-    output: &mut BufWriter<File>,
+fn decompress_chunk<R: BufRead, W: Write + Seek>(
+    mut input: R,
+    mut output: W,
     decoding: &Decoding,
 ) -> io::Result<u64> {
     if input.fill_buf()?.is_empty() {
@@ -289,4 +375,23 @@ fn decompress_chunk(
         output.write_all(&buf[..count])?;
     }
     Ok(total_read)
+}
+
+/// Measure performance of compression or decompression
+fn measure<I: Seek, O: Seek, T>(
+    mut input: I,
+    mut output: O,
+    process: impl Fn(&mut I, &mut O) -> io::Result<T>,
+) -> io::Result<Measurement> {
+    let start_time = Instant::now();
+    process(&mut input, &mut output)?;
+    let end_time = Instant::now();
+    let input_pos = input.stream_position()?;
+    let output_pos = output.stream_position()?;
+
+    Ok(Measurement {
+        input_len: input_pos,
+        output_len: output_pos,
+        elapsed: end_time - start_time,
+    })
 }
