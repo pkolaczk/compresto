@@ -1,9 +1,12 @@
 [package]
 name = "compresto"
-description = "A command-line utility for benchmarking fast compression algorithms"
+description = "A command-line tool to benchmark various compression algorithms"
 version = "0.1.1"
 edition = "2021"
 license = "MIT"
+repository = "https://github.com/pkolaczk/compresto.git"
+keywords = ["compression", "lz4", "zstd", "snappy", "brotli"]
+categories = ["command-line-utilities", "encoding"]
 
 [dependencies]
 anyhow = "1.0.90"
