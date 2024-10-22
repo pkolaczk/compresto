@@ -1,5 +1,6 @@
 [package]
 name = "compresto"
+description = "A command-line utility for benchmarking fast compression algorithms"
 version = "0.1.0"
 edition = "2021"
 
