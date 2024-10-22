@@ -172,7 +172,7 @@ impl Encoding {
             ),
             Self::Zstd { level, dict } => match &dict {
                 Some(dict) => {
-                    let mut encoder = zstd::Encoder::with_prepared_dictionary(output, &dict)?;
+                    let mut encoder = zstd::Encoder::with_prepared_dictionary(output, dict)?;
                     encoder.include_checksum(false)?;
                     encoder.long_distance_matching(false)?;
                     Box::new(encoder)
@@ -201,7 +201,7 @@ impl Decoding {
             Self::Lz4 => Box::new(lz4::Decoder::new(input)?),
             Self::Zstd { dict, .. } => match &dict {
                 Some(dict) => {
-                    Box::new(zstd::Decoder::with_prepared_dictionary(input, &dict)?.single_frame())
+                    Box::new(zstd::Decoder::with_prepared_dictionary(input, dict)?.single_frame())
                 }
                 None => Box::new(zstd::Decoder::new(input)?),
             },
@@ -384,7 +384,7 @@ fn open_output(input_path: &Path, algorithm: Algorithm, compress: bool) -> Resul
 }
 
 fn decoding(dict: Option<&Vec<u8>>, algorithm: Algorithm) -> Decoding {
-    let decoding = match algorithm {
+    match algorithm {
         Algorithm::Copy => Decoding::Copy,
         Algorithm::Lz4 => Decoding::Lz4,
         Algorithm::Brotli => Decoding::Brotli,
@@ -392,12 +392,11 @@ fn decoding(dict: Option<&Vec<u8>>, algorithm: Algorithm) -> Decoding {
             dict: dict.map(|d| DecoderDictionary::copy(d)),
         },
         Algorithm::Snappy => Decoding::Snappy,
-    };
-    decoding
+    }
 }
 
 fn encoding(dict: Option<&Vec<u8>>, algorithm: Algorithm, compression: i32) -> Encoding {
-    let encoding = match algorithm {
+    match algorithm {
         Algorithm::Copy => Encoding::Copy,
         Algorithm::Lz4 => Encoding::Lz4(
             compression.try_into().unwrap_or_default(),
@@ -410,8 +409,7 @@ fn encoding(dict: Option<&Vec<u8>>, algorithm: Algorithm, compression: i32) -> E
             compression.try_into().unwrap_or_default(),
         ),
         Algorithm::Snappy => Encoding::Snappy,
-    };
-    encoding
+    }
 }
 
 fn dictionary(input_cfg: &InputCfg) -> io::Result<Option<Vec<u8>>> {
@@ -429,11 +427,11 @@ fn dictionary(input_cfg: &InputCfg) -> io::Result<Option<Vec<u8>>> {
 }
 
 fn load_dictionary(path: &Path, len: u64) -> io::Result<Vec<u8>> {
-    let mut dict_input = File::open(&path)?;
+    let mut dict_input = File::open(path)?;
     let to_read = min(len, dict_input.metadata()?.len()) as usize;
     let mut data = vec![0_u8; to_read];
     let mut ptr = &mut data[0..];
-    while ptr.len() > 0 {
+    while !ptr.is_empty() {
         let count = dict_input.read(ptr)?;
         ptr = &mut ptr[count..];
     }
@@ -449,7 +447,8 @@ fn compress<R: Read + Seek, W: Write + Seek>(
     let input = BufReader::new(input);
     let output = BufWriter::new(output);
     measure(input, output, |mut i, mut o| {
-        Ok(while compress_chunk(&mut i, &mut o, chunk_size, compression)? == chunk_size {})
+        while compress_chunk(&mut i, &mut o, chunk_size, compression)? == chunk_size {}
+        Ok(())
     })
 }
 
@@ -487,7 +486,8 @@ fn decompress<R: Read + Seek, W: Write + Seek>(
     let input = BufReader::new(input);
     let output = BufWriter::new(output);
     measure(input, output, |mut i, mut o| {
-        Ok(while decompress_chunk(&mut i, &mut o, decoding)? > 0 {})
+        while decompress_chunk(&mut i, &mut o, decoding)? > 0 {}
+        Ok(())
     })
 }
 
