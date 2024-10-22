@@ -39,6 +39,17 @@ impl<W: Write> Encoder for brotlic::CompressorWriter<W> {
     }
 }
 
+impl<W: Write> Encoder for snap::write::FrameEncoder<W> {
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        Write::write_all(self, bytes)
+    }
+
+    fn finish(mut self: Box<Self>) -> io::Result<()> {
+        self.flush()?;
+        Ok(())
+    }
+}
+
 pub struct CopyTo<W: Write>(W);
 
 impl<W: Write> CopyTo<W> {

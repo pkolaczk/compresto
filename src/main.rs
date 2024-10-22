@@ -9,6 +9,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use lz4::liblz4::BlockChecksum;
 use std::cmp::min;
 use std::ffi::OsStr;
+use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io;
 use std::io::{BufRead, BufReader, BufWriter, Cursor, Error, Read, Seek, Write};
@@ -21,7 +22,22 @@ use zstd::dict::{DecoderDictionary, EncoderDictionary};
 struct Config {
     #[command(subcommand)]
     command: Command,
+}
 
+#[derive(Subcommand)]
+enum Command {
+    /// Compress a file
+    Compress(CompressionCfg),
+    /// Decompress a file
+    Decompress(DecompressionCfg),
+    /// Benchmark compression+decompression of a single file
+    Benchmark(CompressionCfg),
+    /// Run multiple benchmarks
+    BenchmarkMany(BenchmarkManyCfg),
+}
+
+#[derive(Args, Clone)]
+struct InputCfg {
     /// Input file path
     #[arg()]
     path: PathBuf,
@@ -35,33 +51,45 @@ struct Config {
     dict_len: u64,
 }
 
-#[derive(Subcommand)]
-enum Command {
-    /// Compress a file
-    Compress(CompressionCfg),
-    /// Decompress a file
-    Decompress {
-        /// Compression algorithm. If not given, determined automatically from the file extension.
-        #[clap(long, short = 'a')]
-        algorithm: Option<Algorithm>,
-    },
-
-    /// Benchmark compression+decompression of a single run
-    Benchmark(CompressionCfg),
-}
-
 #[derive(Args)]
 struct CompressionCfg {
+    #[clap(flatten)]
+    input: InputCfg,
+
     /// Compression algorithm
-    #[clap(long, short = 'a', default_value = "zstd")]
+    #[arg(long, short = 'a', default_value = "zstd")]
     algorithm: Algorithm,
 
     /// Compression level
-    #[clap(long, short = 'c', default_value = "1", allow_hyphen_values = true)]
+    #[arg(long, short = 'c', default_value = "1", allow_hyphen_values = true)]
     compression: i32,
 
     /// Size of a file chunk in bytes. Each chunk is compressed independently.
-    #[clap(long, short = 'b', default_value = "16384")]
+    #[arg(long, short = 'b', default_value = "16384")]
+    chunk_size: u64,
+}
+
+#[derive(Args)]
+struct DecompressionCfg {
+    #[clap(flatten)]
+    input: InputCfg,
+
+    /// Compression algorithm. If not given, determined automatically from the file extension.
+    #[clap(long, short = 'a')]
+    algorithm: Option<Algorithm>,
+}
+
+#[derive(Args)]
+struct BenchmarkManyCfg {
+    #[clap(flatten)]
+    input: InputCfg,
+
+    /// List of algorithms to benchmark
+    #[arg(value_delimiter = ',', default_value = "lz4,snappy,zstd,brotli")]
+    algorithms: Vec<Algorithm>,
+
+    /// Size of a file chunk in bytes. Each chunk is compressed independently.
+    #[arg(long, short = 'b', default_value = "16384")]
     chunk_size: u64,
 }
 
@@ -71,6 +99,7 @@ enum Algorithm {
     Lz4,
     Zstd,
     Brotli,
+    Snappy,
 }
 
 impl Algorithm {
@@ -80,6 +109,7 @@ impl Algorithm {
             Algorithm::Zstd => "zstd",
             Algorithm::Lz4 => "lz4",
             Algorithm::Brotli => "br",
+            Algorithm::Snappy => "sz",
         }
     }
 
@@ -89,12 +119,24 @@ impl Algorithm {
             Some("zstd") => Some(Self::Zstd),
             Some("lz4") => Some(Self::Lz4),
             Some("br") => Some(Self::Brotli),
+            Some("sz") => Some(Self::Snappy),
             _ => None,
+        }
+    }
+
+    fn get_compression_levels(&self) -> Vec<i32> {
+        match self {
+            Algorithm::Copy => vec![0],
+            Algorithm::Zstd => Vec::from_iter((-7..=-1).chain(1..=22)),
+            Algorithm::Lz4 => Vec::from_iter(1..=9),
+            Algorithm::Brotli => Vec::from_iter(1..=11),
+            Algorithm::Snappy => vec![0]
         }
     }
 }
 
 enum Encoding {
+    Copy,
     Lz4 {
         level: u32,
     },
@@ -105,21 +147,24 @@ enum Encoding {
     Brotli {
         level: u8,
     },
-    Copy,
+    Snappy,
 }
 
 enum Decoding {
+    Copy,
     Lz4,
     Zstd {
         dict: Option<DecoderDictionary<'static>>,
     },
     Brotli,
-    Copy,
+    Snappy,
 }
 
 impl Encoding {
     fn new_encoder<'a, W: Write + 'a>(&self, output: W) -> anyhow::Result<Box<dyn Encoder + 'a>> {
         Ok(match self {
+            Self::Copy => Box::new(CopyTo::new(output)),
+
             Self::Lz4 { level } => Box::new(
                 lz4::EncoderBuilder::new()
                     .favor_dec_speed(true)
@@ -145,7 +190,9 @@ impl Encoding {
                     .build()?;
                 Box::new(CompressorWriter::with_encoder(encoder, output))
             }
-            Self::Copy => Box::new(CopyTo::new(output)),
+            Self::Snappy => {
+                Box::new(snap::write::FrameEncoder::new(output))
+            }
         })
     }
 }
@@ -161,6 +208,9 @@ impl Decoding {
                 None => Box::new(zstd::Decoder::new(input)?),
             },
             Self::Brotli => Box::new(brotlic::DecompressorReader::new(input)),
+            Self::Snappy => {
+                Box::new(snap::read::FrameDecoder::new(input))
+            }
             Self::Copy => Box::new(CopyFrom::new(input)),
         })
     }
@@ -195,6 +245,30 @@ impl Measurement {
     }
 }
 
+struct BenchmarkResult {
+    cfg: CompressionCfg,
+    compression: Measurement,
+    decompression: Measurement,
+}
+
+impl Display for BenchmarkResult {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} -c {}: {}, compression: {:.1} MB/s, decompression: {:.1} MB/s",
+            self.cfg
+                .algorithm
+                .to_possible_value()
+                .unwrap_or_default()
+                .get_name(),
+            self.cfg.compression,
+            self.compression.format_compression(),
+            self.compression.input_throughtput() / 1_000_000.0,
+            self.decompression.output_throughtput() / 1_000_000.0
+        )
+    }
+}
+
 fn main() {
     let cmd = Config::parse();
     if let Err(e) = run(cmd) {
@@ -204,90 +278,108 @@ fn main() {
 }
 
 fn run(cmd: Config) -> anyhow::Result<()> {
-    let mut input = File::open(&cmd.path).map_err(|e| {
-        Error::new(
-            e.kind(),
-            format!("Could not open file {}: {}", cmd.path.display(), e),
-        )
-    })?;
+    match cmd.command {
+        Command::Decompress(cfg) => run_decompress_cmd(cfg),
+        Command::Compress(cfg) => run_compress_cmd(cfg),
+        Command::Benchmark(cfg) => run_benchmark_cmd(cfg).map(|_| ()),
+        Command::BenchmarkMany(cfg) => run_benchmark_many_cmd(cfg),
+    }
+}
 
-    let dict = match &cmd.dict {
-        None => None,
-        Some(path) => Some(load_dictionary(&path, cmd.dict_len).map_err(|e| {
-            Error::new(
-                e.kind(),
-                format!("Failed to load dictionary {}: {}", path.display(), e),
-            )
-        })?),
+fn run_decompress_cmd(cfg: DecompressionCfg) -> anyhow::Result<()> {
+    let Some(algorithm) = cfg
+        .algorithm
+        .and_then(|_| Algorithm::from_file_name(&cfg.input.path))
+    else {
+        bail!("Cannot determine compression algorithm from the extension. Please use -a/--algorithm option.");
     };
 
-    match &cmd.command {
-        Command::Decompress { algorithm } => {
-            let Some(algorithm) = algorithm.and_then(|_| Algorithm::from_file_name(&cmd.path))
-            else {
-                bail!("Cannot determine compression algorithm from the extension. Please use -a/--algorithm option.");
+    let dict = dictionary(&cfg.input)?;
+    let decoding = decoding(dict.as_ref(), algorithm);
+    let input = open_input(&cfg.input)?;
+    let output = open_output(&cfg.input.path, algorithm, false)?;
+    let result = decompress(input, output, &decoding)?;
+    eprintln!(
+        "{}, {:.1} MB/s",
+        result.format_compression(),
+        result.output_throughtput() / 1_000_000.0
+    );
+    Ok(())
+}
+
+fn run_compress_cmd(cfg: CompressionCfg) -> anyhow::Result<()> {
+    let dict = dictionary(&cfg.input)?;
+    let encoding = encoding(dict.as_ref(), cfg.algorithm, cfg.compression);
+    let input = open_input(&cfg.input)?;
+    let output = open_output(&cfg.input.path, cfg.algorithm, true)?;
+    let result = compress(input, output, cfg.chunk_size, &encoding)?;
+    eprintln!(
+        "{}, {:.1} MB/s",
+        result.format_compression(),
+        result.input_throughtput() / 1_000_000.0
+    );
+    Ok(())
+}
+
+fn run_benchmark_cmd(cfg: CompressionCfg) -> anyhow::Result<BenchmarkResult> {
+    let dict = dictionary(&cfg.input)?;
+    let encoding = encoding(dict.as_ref(), cfg.algorithm, cfg.compression);
+    let decoding = decoding(dict.as_ref(), cfg.algorithm);
+
+    let mut input = open_input(&cfg.input)?;
+    let mut buffered_input = Vec::new();
+    input.read_to_end(&mut buffered_input)?;
+    let mut input = Cursor::new(buffered_input);
+    let mut output = Cursor::new(Vec::<u8>::new());
+    let c_perf = compress(&mut input, &mut output, cfg.chunk_size, &encoding)?;
+    output.rewind()?;
+    let d_perf = decompress(output, Cursor::new(Vec::<u8>::new()), &decoding)?;
+    let result = BenchmarkResult {
+        cfg,
+        compression: c_perf,
+        decompression: d_perf,
+    };
+    println!("{}", result);
+    Ok(result)
+}
+
+fn run_benchmark_many_cmd(cfg: BenchmarkManyCfg) -> anyhow::Result<()> {
+    for algorithm in cfg.algorithms {
+        let mut last_output_size = u64::MAX;
+        for level in algorithm.get_compression_levels() {
+            let run_cfg = CompressionCfg {
+                input: cfg.input.clone(),
+                algorithm,
+                compression: level,
+                chunk_size: cfg.chunk_size,
             };
-            let decoding = decoding(dict.as_ref(), algorithm);
-            let output = open_output(&cmd)?;
-            let result = decompress(input, output, &decoding)?;
-            eprintln!(
-                "{}, {:.1} MB/s",
-                result.format_compression(),
-                result.output_throughtput() / 1_000_000.0
-            );
-        }
-        Command::Compress(CompressionCfg {
-            algorithm,
-            compression,
-            chunk_size,
-        }) => {
-            let encoding = encoding(dict.as_ref(), *algorithm, *compression);
-            let output = open_output(&cmd)?;
-            let result = compress(input, output, *chunk_size, &encoding)?;
-            eprintln!(
-                "{}, {:.1} MB/s",
-                result.format_compression(),
-                result.input_throughtput() / 1_000_000.0
-            );
-        }
-        Command::Benchmark(CompressionCfg {
-            algorithm,
-            compression,
-            chunk_size,
-        }) => {
-            let encoding = encoding(dict.as_ref(), *algorithm, *compression);
-            let decoding = decoding(dict.as_ref(), *algorithm);
-            let mut buffered_input = Vec::new();
-            input.read_to_end(&mut buffered_input)?;
-            let mut input = Cursor::new(buffered_input);
-            let mut output = Cursor::new(Vec::<u8>::new());
-            let c_perf = compress(&mut input, &mut output, *chunk_size, &encoding)?;
-            output.rewind()?;
-            let d_perf = decompress(output, Cursor::new(Vec::<u8>::new()), &decoding)?;
-            println!(
-                "{}, compression: {:.1} MB/s, decompression: {:.1} MB/s",
-                c_perf.format_compression(),
-                c_perf.input_throughtput() / 1_000_000.0,
-                d_perf.output_throughtput() / 1_000_000.0
-            );
+            let result = run_benchmark_cmd(run_cfg)?;
+            if result.compression.output_len > (last_output_size as f64 * 0.999) as u64 {
+                break;
+            }
+            last_output_size = result.compression.output_len;
         }
     }
     Ok(())
 }
 
-fn open_output(cmd: &Config) -> Result<File, Error> {
-    let extension_suffix = match &cmd.command {
-        Command::Compress(CompressionCfg { algorithm, .. }) => algorithm.extension(),
-        Command::Decompress { .. } => "",
-        Command::Benchmark(_) => "",
-    };
+fn open_input(config: &InputCfg) -> Result<File, Error> {
+    File::open(&config.path).map_err(|e| {
+        Error::new(
+            e.kind(),
+            format!("Could not open file {}: {}", config.path.display(), e),
+        )
+    })
+}
 
-    let new_extension = match cmd.path.extension() {
+fn open_output(input_path: &Path, algorithm: Algorithm, compress: bool) -> Result<File, Error> {
+    let extension_suffix = if compress { algorithm.extension() } else { "" };
+
+    let new_extension = match input_path.extension() {
         None => extension_suffix.to_owned(),
         Some(ext) => format!("{}.{}", ext.to_string_lossy(), extension_suffix),
     };
-    let output_path = cmd.path.clone().with_extension(new_extension);
-
+    let output_path = input_path.with_extension(new_extension);
     let output = File::create(&output_path).map_err(|e| {
         Error::new(
             e.kind(),
@@ -305,6 +397,7 @@ fn decoding(dict: Option<&Vec<u8>>, algorithm: Algorithm) -> Decoding {
         Algorithm::Zstd => Decoding::Zstd {
             dict: dict.map(|d| DecoderDictionary::copy(d)),
         },
+        Algorithm::Snappy => Decoding::Snappy,
     };
     decoding
 }
@@ -322,8 +415,23 @@ fn encoding(dict: Option<&Vec<u8>>, algorithm: Algorithm, compression: i32) -> E
         Algorithm::Brotli => Encoding::Brotli {
             level: compression.try_into().unwrap_or_default(),
         },
+        Algorithm::Snappy => Encoding::Snappy,
     };
     encoding
+}
+
+fn dictionary(input_cfg: &InputCfg) -> io::Result<Option<Vec<u8>>> {
+    match input_cfg.dict.as_ref() {
+        None => Ok(None),
+        Some(p) => Ok(Some(load_dictionary(p, input_cfg.dict_len).map_err(
+            |e| {
+                Error::new(
+                    e.kind(),
+                    format!("Failed to load dictionary {}: {}", p.display(), e),
+                )
+            },
+        )?)),
+    }
 }
 
 fn load_dictionary(path: &Path, len: u64) -> io::Result<Vec<u8>> {
