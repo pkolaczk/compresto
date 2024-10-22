@@ -1,5 +1,6 @@
 mod decoder;
 mod encoder;
+mod discard;
 
 use crate::decoder::{CopyFrom, Decoder};
 use crate::encoder::{CopyTo, Encoder};
@@ -17,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::time::{Duration, Instant};
 use zstd::dict::{DecoderDictionary, EncoderDictionary};
+use crate::discard::Discard;
 
 #[derive(Parser)]
 struct Config {
@@ -85,7 +87,7 @@ struct BenchmarkManyCfg {
     input: InputCfg,
 
     /// List of algorithms to benchmark
-    #[arg(value_delimiter = ',', default_value = "lz4,snappy,zstd,brotli")]
+    #[arg(long, short = 'a', value_delimiter = ',', default_value = "lz4,snappy,zstd,brotli", num_args = 1..)]
     algorithms: Vec<Algorithm>,
 
     /// Size of a file chunk in bytes. Each chunk is compressed independently.
@@ -127,26 +129,22 @@ impl Algorithm {
     fn get_compression_levels(&self) -> Vec<i32> {
         match self {
             Algorithm::Copy => vec![0],
-            Algorithm::Zstd => Vec::from_iter((-7..=-1).chain(1..=22)),
+            Algorithm::Zstd => Vec::from_iter((-7..=-1).chain(1..=12)),
             Algorithm::Lz4 => Vec::from_iter(1..=9),
-            Algorithm::Brotli => Vec::from_iter(1..=11),
-            Algorithm::Snappy => vec![0]
+            Algorithm::Brotli => Vec::from_iter(1..=8),
+            Algorithm::Snappy => vec![0],
         }
     }
 }
 
 enum Encoding {
     Copy,
-    Lz4 {
-        level: u32,
-    },
+    Lz4(u32),
     Zstd {
         level: i32,
         dict: Option<EncoderDictionary<'static>>,
     },
-    Brotli {
-        level: u8,
-    },
+    Brotli(u8),
     Snappy,
 }
 
@@ -165,7 +163,7 @@ impl Encoding {
         Ok(match self {
             Self::Copy => Box::new(CopyTo::new(output)),
 
-            Self::Lz4 { level } => Box::new(
+            Self::Lz4(level) => Box::new(
                 lz4::EncoderBuilder::new()
                     .favor_dec_speed(true)
                     .block_checksum(BlockChecksum::NoBlockChecksum)
@@ -181,7 +179,7 @@ impl Encoding {
                 }
                 None => Box::new(zstd::Encoder::new(output, *level)?),
             },
-            Self::Brotli { level } => {
+            Self::Brotli(level) => {
                 let encoder = brotlic::BrotliEncoderOptions::new()
                     .quality(Quality::new(*level)?)
                     .window_size(WindowSize::new(16)?)
@@ -198,7 +196,7 @@ impl Encoding {
 }
 
 impl Decoding {
-    fn new_decoder<'a, R: BufRead + 'a>(&self, input: R) -> io::Result<Box<dyn Decoder + 'a>> {
+    fn new_decoder<'a, R: BufRead + 'a>(&self, input: R) -> anyhow::Result<Box<dyn Decoder + 'a>> {
         Ok(match self {
             Self::Lz4 => Box::new(lz4::Decoder::new(input)?),
             Self::Zstd { dict, .. } => match &dict {
@@ -289,7 +287,7 @@ fn run(cmd: Config) -> anyhow::Result<()> {
 fn run_decompress_cmd(cfg: DecompressionCfg) -> anyhow::Result<()> {
     let Some(algorithm) = cfg
         .algorithm
-        .and_then(|_| Algorithm::from_file_name(&cfg.input.path))
+        .or_else(|| Algorithm::from_file_name(&cfg.input.path))
     else {
         bail!("Cannot determine compression algorithm from the extension. Please use -a/--algorithm option.");
     };
@@ -329,11 +327,12 @@ fn run_benchmark_cmd(cfg: CompressionCfg) -> anyhow::Result<BenchmarkResult> {
     let mut input = open_input(&cfg.input)?;
     let mut buffered_input = Vec::new();
     input.read_to_end(&mut buffered_input)?;
+    let input_len = buffered_input.len();
     let mut input = Cursor::new(buffered_input);
-    let mut output = Cursor::new(Vec::<u8>::new());
+    let mut output = Cursor::new(Vec::<u8>::with_capacity(input_len));
     let c_perf = compress(&mut input, &mut output, cfg.chunk_size, &encoding)?;
     output.rewind()?;
-    let d_perf = decompress(output, Cursor::new(Vec::<u8>::new()), &decoding)?;
+    let d_perf = decompress(output, Discard::default(), &decoding)?;
     let result = BenchmarkResult {
         cfg,
         compression: c_perf,
@@ -345,7 +344,6 @@ fn run_benchmark_cmd(cfg: CompressionCfg) -> anyhow::Result<BenchmarkResult> {
 
 fn run_benchmark_many_cmd(cfg: BenchmarkManyCfg) -> anyhow::Result<()> {
     for algorithm in cfg.algorithms {
-        let mut last_output_size = u64::MAX;
         for level in algorithm.get_compression_levels() {
             let run_cfg = CompressionCfg {
                 input: cfg.input.clone(),
@@ -353,11 +351,7 @@ fn run_benchmark_many_cmd(cfg: BenchmarkManyCfg) -> anyhow::Result<()> {
                 compression: level,
                 chunk_size: cfg.chunk_size,
             };
-            let result = run_benchmark_cmd(run_cfg)?;
-            if result.compression.output_len > (last_output_size as f64 * 0.999) as u64 {
-                break;
-            }
-            last_output_size = result.compression.output_len;
+            run_benchmark_cmd(run_cfg)?;
         }
     }
     Ok(())
@@ -405,16 +399,16 @@ fn decoding(dict: Option<&Vec<u8>>, algorithm: Algorithm) -> Decoding {
 fn encoding(dict: Option<&Vec<u8>>, algorithm: Algorithm, compression: i32) -> Encoding {
     let encoding = match algorithm {
         Algorithm::Copy => Encoding::Copy,
-        Algorithm::Lz4 => Encoding::Lz4 {
-            level: compression.try_into().unwrap_or_default(),
-        },
+        Algorithm::Lz4 => Encoding::Lz4(
+            compression.try_into().unwrap_or_default(),
+        ),
         Algorithm::Zstd => Encoding::Zstd {
             level: compression,
             dict: dict.map(|d| EncoderDictionary::copy(d, compression)),
         },
-        Algorithm::Brotli => Encoding::Brotli {
-            level: compression.try_into().unwrap_or_default(),
-        },
+        Algorithm::Brotli => Encoding::Brotli(
+            compression.try_into().unwrap_or_default(),
+        ),
         Algorithm::Snappy => Encoding::Snappy,
     };
     encoding
