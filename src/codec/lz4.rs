@@ -1,6 +1,6 @@
-use std::io;
-use lz4::block::CompressionMode;
 use crate::codec::{Decoder, Encoder};
+use lz4::block::CompressionMode;
+use std::io;
 
 pub struct Lz4Compressor(pub CompressionMode);
 
@@ -31,4 +31,3 @@ impl Decoder for Lz4Decompressor {
         lz4::block::decompress_to_buffer(src, Some(dest.len() as i32), dest)
     }
 }
-

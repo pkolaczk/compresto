@@ -1,6 +1,6 @@
+use crate::codec::{Decoder, Encoder};
 use std::io;
 use std::io::ErrorKind;
-use crate::codec::{Decoder, Encoder};
 
 impl Encoder for snap::raw::Encoder {
     fn compressed_len_bound(&mut self, uncompressed_len: usize) -> usize {
@@ -19,4 +19,3 @@ impl Decoder for snap::raw::Decoder {
             .map_err(|e| io::Error::new(ErrorKind::Other, e))
     }
 }
-

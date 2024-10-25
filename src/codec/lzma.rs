@@ -1,7 +1,7 @@
+use crate::codec::{Decoder, Encoder};
+use lzma_sys::lzma_stream_buffer_bound;
 use std::io;
 use std::io::{Cursor, Read, Seek, Write};
-use lzma_sys::lzma_stream_buffer_bound;
-use crate::codec::{Decoder, Encoder};
 
 pub struct LzmaCompressor(pub u32);
 pub struct LzmaDecompressor;

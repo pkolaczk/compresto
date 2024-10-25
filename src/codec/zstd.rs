@@ -1,6 +1,6 @@
+use crate::codec::{Decoder, Encoder};
 use std::io;
 use zstd::zstd_safe;
-use crate::codec::{Decoder, Encoder};
 
 impl Encoder for zstd::bulk::Compressor<'_> {
     fn compressed_len_bound(&mut self, src_len: usize) -> usize {

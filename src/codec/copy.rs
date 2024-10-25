@@ -1,5 +1,5 @@
-use std::io;
 use crate::codec::{Decoder, Encoder};
+use std::io;
 
 pub struct Copy;
 

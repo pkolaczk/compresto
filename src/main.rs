@@ -5,6 +5,7 @@ use crate::discard::Discard;
 use anyhow::bail;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use codec::{brotli, lzma};
 use std::cmp::min;
 use std::ffi::OsStr;
 use std::fmt::{Display, Formatter};
@@ -14,7 +15,6 @@ use std::io::{BufRead, BufReader, Cursor, Error, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::time::{Duration, Instant};
-use codec::{brotli, lzma};
 
 #[derive(Parser)]
 struct Config {
@@ -83,7 +83,7 @@ struct BenchmarkManyCfg {
     input: InputCfg,
 
     /// List of algorithms to benchmark
-    #[arg(long, short = 'a', value_delimiter = ',', default_value = "lz4,snappy,zstd,brotli", num_args = 1..)]
+    #[arg(long, short = 'a', value_delimiter = ',', default_value = "lz4,lzav,snappy,zstd,brotli", num_args = 1..)]
     algorithms: Vec<Algorithm>,
 
     /// Size of a file chunk in bytes. Each chunk is compressed independently.
@@ -99,6 +99,7 @@ enum Algorithm {
     Brotli,
     Snappy,
     Lzma,
+    Lzav,
 }
 
 impl Algorithm {
@@ -110,6 +111,7 @@ impl Algorithm {
             Algorithm::Brotli => "br",
             Algorithm::Snappy => "sz",
             Algorithm::Lzma => "xz",
+            Algorithm::Lzav => "lzav",
         }
     }
 
@@ -121,6 +123,7 @@ impl Algorithm {
             Some("br") => Some(Self::Brotli),
             Some("sz") => Some(Self::Snappy),
             Some("xz") => Some(Self::Lzma),
+            Some("lzav") => Some(Self::Lzav),
             _ => None,
         }
     }
@@ -133,6 +136,7 @@ impl Algorithm {
             Algorithm::Brotli => Vec::from_iter(1..=8),
             Algorithm::Snappy => vec![0],
             Algorithm::Lzma => vec![0],
+            Algorithm::Lzav => vec![0, 1],
         }
     }
 }
@@ -326,6 +330,7 @@ fn encoder(
         }
         (Algorithm::Snappy, _) => Box::new(snap::raw::Encoder::new()),
         (Algorithm::Lzma, _) => Box::new(lzma::LzmaCompressor(compression as u32)),
+        (Algorithm::Lzav, _) => Box::new(codec::lzav::LzavCompressor::new(compression as u32)),
     })
 }
 
@@ -337,13 +342,12 @@ fn decoder(
         (Algorithm::Copy, _) => Box::new(codec::copy::Copy),
         (Algorithm::Lz4, _) => Box::new(codec::lz4::Lz4Decompressor),
         (Algorithm::Zstd, None) => Box::new(zstd::bulk::Decompressor::new()?),
-        (Algorithm::Zstd, Some(dict)) => {
-            Box::new(zstd::bulk::Decompressor::with_dictionary(dict)?)
-        }
+        (Algorithm::Zstd, Some(dict)) => Box::new(zstd::bulk::Decompressor::with_dictionary(dict)?),
         (Algorithm::Brotli, None) => Box::new(brotli::BrotliDecompressor),
         (Algorithm::Brotli, Some(dict)) => Box::new(brotli::BrotliDictDecompressor::new(dict)),
         (Algorithm::Snappy, _) => Box::new(snap::raw::Decoder::new()),
         (Algorithm::Lzma, _) => Box::new(lzma::LzmaDecompressor),
+        (Algorithm::Lzav, _) => Box::new(codec::lzav::LzavDecompressor),
     })
 }
 
