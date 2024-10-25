@@ -1,24 +1,20 @@
-mod decoder;
-mod encoder;
+mod codec;
 mod discard;
 
-use crate::decoder::{CopyFrom, Decoder};
-use crate::encoder::{CopyTo, Encoder};
+use crate::discard::Discard;
 use anyhow::bail;
-use brotlic::{BlockSize, CompressionMode, CompressorWriter, Quality, WindowSize};
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use lz4::liblz4::BlockChecksum;
 use std::cmp::min;
 use std::ffi::OsStr;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io;
-use std::io::{BufRead, BufReader, BufWriter, Cursor, Error, Read, Seek, Write};
+use std::io::{BufRead, BufReader, Cursor, Error, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::time::{Duration, Instant};
-use zstd::dict::{DecoderDictionary, EncoderDictionary};
-use crate::discard::Discard;
+use codec::{brotli, lzma};
 
 #[derive(Parser)]
 struct Config {
@@ -68,7 +64,7 @@ struct CompressionCfg {
 
     /// Size of a file chunk in bytes. Each chunk is compressed independently.
     #[arg(long, short = 'b', default_value = "16384")]
-    chunk_size: u64,
+    chunk_size: usize,
 }
 
 #[derive(Args)]
@@ -92,7 +88,7 @@ struct BenchmarkManyCfg {
 
     /// Size of a file chunk in bytes. Each chunk is compressed independently.
     #[arg(long, short = 'b', default_value = "16384")]
-    chunk_size: u64,
+    chunk_size: usize,
 }
 
 #[derive(ValueEnum, Copy, Clone)]
@@ -102,6 +98,7 @@ enum Algorithm {
     Zstd,
     Brotli,
     Snappy,
+    Lzma,
 }
 
 impl Algorithm {
@@ -112,6 +109,7 @@ impl Algorithm {
             Algorithm::Lz4 => "lz4",
             Algorithm::Brotli => "br",
             Algorithm::Snappy => "sz",
+            Algorithm::Lzma => "xz",
         }
     }
 
@@ -122,6 +120,7 @@ impl Algorithm {
             Some("lz4") => Some(Self::Lz4),
             Some("br") => Some(Self::Brotli),
             Some("sz") => Some(Self::Snappy),
+            Some("xz") => Some(Self::Lzma),
             _ => None,
         }
     }
@@ -130,87 +129,11 @@ impl Algorithm {
         match self {
             Algorithm::Copy => vec![0],
             Algorithm::Zstd => Vec::from_iter((-7..=-1).chain(1..=12)),
-            Algorithm::Lz4 => Vec::from_iter(1..=9),
+            Algorithm::Lz4 => Vec::from_iter((-9..=-1).chain(1..=9)),
             Algorithm::Brotli => Vec::from_iter(1..=8),
             Algorithm::Snappy => vec![0],
+            Algorithm::Lzma => vec![0],
         }
-    }
-}
-
-enum Encoding {
-    Copy,
-    Lz4(u32),
-    Zstd {
-        level: i32,
-        dict: Option<EncoderDictionary<'static>>,
-    },
-    Brotli(u8),
-    Snappy,
-}
-
-enum Decoding {
-    Copy,
-    Lz4,
-    Zstd {
-        dict: Option<DecoderDictionary<'static>>,
-    },
-    Brotli,
-    Snappy,
-}
-
-impl Encoding {
-    fn new_encoder<'a, W: Write + 'a>(&self, output: W) -> anyhow::Result<Box<dyn Encoder + 'a>> {
-        Ok(match self {
-            Self::Copy => Box::new(CopyTo::new(output)),
-
-            Self::Lz4(level) => Box::new(
-                lz4::EncoderBuilder::new()
-                    .favor_dec_speed(true)
-                    .block_checksum(BlockChecksum::NoBlockChecksum)
-                    .level(*level)
-                    .build(output)?,
-            ),
-            Self::Zstd { level, dict } => match &dict {
-                Some(dict) => {
-                    let mut encoder = zstd::Encoder::with_prepared_dictionary(output, dict)?;
-                    encoder.include_checksum(false)?;
-                    encoder.long_distance_matching(false)?;
-                    Box::new(encoder)
-                }
-                None => Box::new(zstd::Encoder::new(output, *level)?),
-            },
-            Self::Brotli(level) => {
-                let encoder = brotlic::BrotliEncoderOptions::new()
-                    .quality(Quality::new(*level)?)
-                    .window_size(WindowSize::new(16)?)
-                    .block_size(BlockSize::new(16)?)
-                    .mode(CompressionMode::Generic)
-                    .build()?;
-                Box::new(CompressorWriter::with_encoder(encoder, output))
-            }
-            Self::Snappy => {
-                Box::new(snap::write::FrameEncoder::new(output))
-            }
-        })
-    }
-}
-
-impl Decoding {
-    fn new_decoder<'a, R: BufRead + 'a>(&self, input: R) -> anyhow::Result<Box<dyn Decoder + 'a>> {
-        Ok(match self {
-            Self::Lz4 => Box::new(lz4::Decoder::new(input)?),
-            Self::Zstd { dict, .. } => match &dict {
-                Some(dict) => {
-                    Box::new(zstd::Decoder::with_prepared_dictionary(input, dict)?.single_frame())
-                }
-                None => Box::new(zstd::Decoder::new(input)?),
-            },
-            Self::Brotli => Box::new(brotlic::DecompressorReader::new(input)),
-            Self::Snappy => {
-                Box::new(snap::read::FrameDecoder::new(input))
-            }
-            Self::Copy => Box::new(CopyFrom::new(input)),
-        })
     }
 }
 
@@ -293,10 +216,10 @@ fn run_decompress_cmd(cfg: DecompressionCfg) -> anyhow::Result<()> {
     };
 
     let dict = dictionary(&cfg.input)?;
-    let decoding = decoding(dict.as_ref(), algorithm);
+    let mut decoder = decoder(algorithm, dict.as_ref())?;
     let input = open_input(&cfg.input)?;
     let output = open_output(&cfg.input.path, algorithm, false)?;
-    let result = decompress(input, output, &decoding)?;
+    let result = decompress(input, output, decoder.as_mut())?;
     eprintln!(
         "{}, {:.1} MB/s",
         result.format_compression(),
@@ -307,10 +230,10 @@ fn run_decompress_cmd(cfg: DecompressionCfg) -> anyhow::Result<()> {
 
 fn run_compress_cmd(cfg: CompressionCfg) -> anyhow::Result<()> {
     let dict = dictionary(&cfg.input)?;
-    let encoding = encoding(dict.as_ref(), cfg.algorithm, cfg.compression);
+    let mut encoder = encoder(cfg.algorithm, cfg.compression, dict.as_ref())?;
     let input = open_input(&cfg.input)?;
     let output = open_output(&cfg.input.path, cfg.algorithm, true)?;
-    let result = compress(input, output, cfg.chunk_size, &encoding)?;
+    let result = compress(input, output, cfg.chunk_size, encoder.as_mut())?;
     eprintln!(
         "{}, {:.1} MB/s",
         result.format_compression(),
@@ -321,18 +244,20 @@ fn run_compress_cmd(cfg: CompressionCfg) -> anyhow::Result<()> {
 
 fn run_benchmark_cmd(cfg: CompressionCfg) -> anyhow::Result<BenchmarkResult> {
     let dict = dictionary(&cfg.input)?;
-    let encoding = encoding(dict.as_ref(), cfg.algorithm, cfg.compression);
-    let decoding = decoding(dict.as_ref(), cfg.algorithm);
+    let mut encoder = encoder(cfg.algorithm, cfg.compression, dict.as_ref())?;
+    let mut decoder = decoder(cfg.algorithm, dict.as_ref())?;
 
     let mut input = open_input(&cfg.input)?;
     let mut buffered_input = Vec::new();
     input.read_to_end(&mut buffered_input)?;
     let input_len = buffered_input.len();
     let mut input = Cursor::new(buffered_input);
+
     let mut output = Cursor::new(Vec::<u8>::with_capacity(input_len));
-    let c_perf = compress(&mut input, &mut output, cfg.chunk_size, &encoding)?;
+
+    let c_perf = compress(&mut input, &mut output, cfg.chunk_size, encoder.as_mut())?;
     output.rewind()?;
-    let d_perf = decompress(output, Discard::default(), &decoding)?;
+    let d_perf = decompress(output, Discard::default(), decoder.as_mut())?;
     let result = BenchmarkResult {
         cfg,
         compression: c_perf,
@@ -383,33 +308,43 @@ fn open_output(input_path: &Path, algorithm: Algorithm, compress: bool) -> Resul
     Ok(output)
 }
 
-fn decoding(dict: Option<&Vec<u8>>, algorithm: Algorithm) -> Decoding {
-    match algorithm {
-        Algorithm::Copy => Decoding::Copy,
-        Algorithm::Lz4 => Decoding::Lz4,
-        Algorithm::Brotli => Decoding::Brotli,
-        Algorithm::Zstd => Decoding::Zstd {
-            dict: dict.map(|d| DecoderDictionary::copy(d)),
-        },
-        Algorithm::Snappy => Decoding::Snappy,
-    }
+fn encoder(
+    algorithm: Algorithm,
+    compression: i32,
+    dict: Option<&Vec<u8>>,
+) -> anyhow::Result<Box<dyn codec::Encoder>> {
+    Ok(match (algorithm, dict) {
+        (Algorithm::Copy, _) => Box::new(codec::copy::Copy),
+        (Algorithm::Lz4, _) => Box::new(codec::lz4::Lz4Compressor::new(compression)),
+        (Algorithm::Zstd, None) => Box::new(zstd::bulk::Compressor::new(compression)?),
+        (Algorithm::Zstd, Some(dict)) => {
+            Box::new(zstd::bulk::Compressor::with_dictionary(compression, dict)?)
+        }
+        (Algorithm::Brotli, None) => Box::new(brotli::BrotliCompressor(compression)),
+        (Algorithm::Brotli, Some(dict)) => {
+            Box::new(brotli::BrotliDictCompressor::new(compression as u32, dict))
+        }
+        (Algorithm::Snappy, _) => Box::new(snap::raw::Encoder::new()),
+        (Algorithm::Lzma, _) => Box::new(lzma::LzmaCompressor(compression as u32)),
+    })
 }
 
-fn encoding(dict: Option<&Vec<u8>>, algorithm: Algorithm, compression: i32) -> Encoding {
-    match algorithm {
-        Algorithm::Copy => Encoding::Copy,
-        Algorithm::Lz4 => Encoding::Lz4(
-            compression.try_into().unwrap_or_default(),
-        ),
-        Algorithm::Zstd => Encoding::Zstd {
-            level: compression,
-            dict: dict.map(|d| EncoderDictionary::copy(d, compression)),
-        },
-        Algorithm::Brotli => Encoding::Brotli(
-            compression.try_into().unwrap_or_default(),
-        ),
-        Algorithm::Snappy => Encoding::Snappy,
-    }
+fn decoder(
+    algorithm: Algorithm,
+    dict: Option<&Vec<u8>>,
+) -> anyhow::Result<Box<dyn codec::Decoder>> {
+    Ok(match (algorithm, dict) {
+        (Algorithm::Copy, _) => Box::new(codec::copy::Copy),
+        (Algorithm::Lz4, _) => Box::new(codec::lz4::Lz4Decompressor),
+        (Algorithm::Zstd, None) => Box::new(zstd::bulk::Decompressor::new()?),
+        (Algorithm::Zstd, Some(dict)) => {
+            Box::new(zstd::bulk::Decompressor::with_dictionary(dict)?)
+        }
+        (Algorithm::Brotli, None) => Box::new(brotli::BrotliDecompressor),
+        (Algorithm::Brotli, Some(dict)) => Box::new(brotli::BrotliDictDecompressor::new(dict)),
+        (Algorithm::Snappy, _) => Box::new(snap::raw::Decoder::new()),
+        (Algorithm::Lzma, _) => Box::new(lzma::LzmaDecompressor),
+    })
 }
 
 fn dictionary(input_cfg: &InputCfg) -> io::Result<Option<Vec<u8>>> {
@@ -441,83 +376,64 @@ fn load_dictionary(path: &Path, len: u64) -> io::Result<Vec<u8>> {
 fn compress<R: Read + Seek, W: Write + Seek>(
     input: R,
     output: W,
-    chunk_size: u64,
-    compression: &Encoding,
+    chunk_size: usize,
+    encoder: &mut dyn codec::Encoder,
 ) -> anyhow::Result<Measurement> {
-    let input = BufReader::new(input);
-    let output = BufWriter::new(output);
-    measure(input, output, |mut i, mut o| {
-        while compress_chunk(&mut i, &mut o, chunk_size, compression)? == chunk_size {}
+    let input = BufReader::with_capacity(chunk_size, input);
+    let mut tmp_buf = vec![0; encoder.compressed_len_bound(chunk_size)];
+
+    measure(input, output, |input, output| {
+        while !input.fill_buf()?.is_empty() {
+            let input_chunk = input.buffer();
+            let uncompressed_len = input_chunk.len();
+            let compressed_len = encoder.compress(input_chunk, &mut tmp_buf)?;
+            output.write_u32::<LittleEndian>(uncompressed_len.try_into().unwrap())?;
+            output.write_u32::<LittleEndian>(compressed_len.try_into().unwrap())?;
+            output.write_all(&tmp_buf[0..compressed_len])?;
+            input.consume(uncompressed_len);
+        }
+        output.flush()?;
         Ok(())
     })
-}
-
-fn compress_chunk<R: BufRead, W: Write + Seek>(
-    mut input: R,
-    output: W,
-    chunk_size: u64,
-    compression: &Encoding,
-) -> anyhow::Result<u64> {
-    let mut encoder = compression.new_encoder(output)?;
-    let mut remaining = chunk_size;
-    let mut total_read = 0;
-    let mut buf: [u8; 16384] = [0; 16384];
-    while remaining > 0 {
-        let to_read = min(remaining, buf.len() as u64) as usize;
-        let buf = &mut buf[0..to_read];
-        let count = input.read(buf)?;
-        if count == 0 {
-            break;
-        }
-        remaining -= count as u64;
-        total_read += count as u64;
-        let slice = &buf[..count];
-        encoder.write_all(slice)?;
-    }
-    encoder.finish()?;
-    Ok(total_read)
 }
 
 fn decompress<R: Read + Seek, W: Write + Seek>(
     input: R,
     output: W,
-    decoding: &Decoding,
+    decoder: &mut dyn codec::Decoder,
 ) -> anyhow::Result<Measurement> {
-    let input = BufReader::new(input);
-    let output = BufWriter::new(output);
-    measure(input, output, |mut i, mut o| {
-        while decompress_chunk(&mut i, &mut o, decoding)? > 0 {}
+    let input = BufReader::with_capacity(256 * 1024 * 1024, input);
+    let mut src = Vec::new();
+    let mut dest = Vec::new();
+
+    measure(input, output, |input, output| {
+        while !input.fill_buf()?.is_empty() {
+            let uncompressed_len = input.read_u32::<LittleEndian>()?.try_into().unwrap();
+            let frame_len = input.read_u32::<LittleEndian>()?.try_into().unwrap();
+            dest.resize(uncompressed_len, 0);
+            if input.buffer().len() >= frame_len {
+                let src = &input.buffer()[0..frame_len];
+                let count = decoder.decompress(src, &mut dest)?;
+                assert_eq!(count, uncompressed_len);
+                input.consume(frame_len);
+            } else {
+                src.resize(frame_len, 0);
+                input.read_exact(&mut src)?;
+                let count = decoder.decompress(&src, &mut dest)?;
+                assert_eq!(count, uncompressed_len);
+            }
+            output.write_all(&dest)?;
+        }
+        output.flush()?;
         Ok(())
     })
-}
-
-fn decompress_chunk<R: BufRead, W: Write + Seek>(
-    mut input: R,
-    mut output: W,
-    decoding: &Decoding,
-) -> anyhow::Result<u64> {
-    if input.fill_buf()?.is_empty() {
-        return Ok(0);
-    }
-    let mut decoder = decoding.new_decoder(input)?;
-    let mut total_read = 0;
-    let mut buf: [u8; 16384] = [0; 16384];
-    loop {
-        let count = decoder.read(&mut buf)?;
-        if count == 0 {
-            break;
-        }
-        total_read += count as u64;
-        output.write_all(&buf[..count])?;
-    }
-    Ok(total_read)
 }
 
 /// Measure performance of compression or decompression
 fn measure<I: Seek, O: Seek, T>(
     mut input: I,
     mut output: O,
-    process: impl Fn(&mut I, &mut O) -> anyhow::Result<T>,
+    mut process: impl FnMut(&mut I, &mut O) -> anyhow::Result<T>,
 ) -> anyhow::Result<Measurement> {
     let start_time = Instant::now();
     process(&mut input, &mut output)?;
