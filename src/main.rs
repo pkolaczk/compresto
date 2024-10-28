@@ -15,6 +15,8 @@ use std::io::{BufRead, BufReader, Cursor, Error, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::time::{Duration, Instant};
+use human_bytes::human_bytes;
+use serde::Serialize;
 
 #[derive(Parser)]
 struct Config {
@@ -89,9 +91,13 @@ struct BenchmarkManyCfg {
     /// Size of a file chunk in bytes. Each chunk is compressed independently.
     #[arg(long, short = 'b', default_value = "16384")]
     chunk_size: usize,
+
+    /// Save benchmark results to a CSV file
+    #[arg(long, short)]
+    report: Option<PathBuf>
 }
 
-#[derive(ValueEnum, Copy, Clone)]
+#[derive(ValueEnum, Copy, Clone, Serialize)]
 enum Algorithm {
     Copy,
     Lz4,
@@ -170,26 +176,51 @@ impl Measurement {
     }
 }
 
+#[derive(Serialize)]
 struct BenchmarkResult {
-    cfg: CompressionCfg,
-    compression: Measurement,
-    decompression: Measurement,
+    algorithm: Algorithm,
+    level: i32,
+    uncompressed_len: u64,
+    compressed_len: u64,
+    ratio: f64,
+    inv_ratio: f64,
+    compression_speed_mpbs: f64,
+    decompression_speed_mpbs: f64,
+}
+
+impl BenchmarkResult {
+    fn new(cfg: CompressionCfg, compression: Measurement, decompression: Measurement) -> Self {
+        Self {
+            algorithm: cfg.algorithm,
+            level: cfg.compression,
+            uncompressed_len: compression.input_len,
+            compressed_len: compression.output_len,
+            ratio: (compression.compression_ratio() * 1000.0).round() / 1000.0,
+            inv_ratio: (1.0 / compression.compression_ratio() * 1000.0).round() / 1000.0, 
+            compression_speed_mpbs: (compression.input_throughtput() / 100_000.0).round() / 10.0,
+            decompression_speed_mpbs: (decompression.output_throughtput() / 100_000.0).round() / 10.0,
+        }
+    }
 }
 
 impl Display for BenchmarkResult {
+    
+    
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} -c {}: {}, compression: {:.1} MB/s, decompression: {:.1} MB/s",
-            self.cfg
-                .algorithm
+            "{:10} lev. {:3}:    {:8} => {:8} ({:5.1}%, {:4.2}x),    compr.: {:6.1} MB/s, decompr.: {:6.1} MB/s",
+            self.algorithm
                 .to_possible_value()
                 .unwrap_or_default()
                 .get_name(),
-            self.cfg.compression,
-            self.compression.format_compression(),
-            self.compression.input_throughtput() / 1_000_000.0,
-            self.decompression.output_throughtput() / 1_000_000.0
+            self.level,
+            human_bytes(self.uncompressed_len as f64),
+            human_bytes(self.compressed_len as f64),
+            self.ratio * 100.0,
+            1.0 / self.ratio,
+            self.compression_speed_mpbs,
+            self.decompression_speed_mpbs
         )
     }
 }
@@ -262,16 +293,14 @@ fn run_benchmark_cmd(cfg: CompressionCfg) -> anyhow::Result<BenchmarkResult> {
     let c_perf = compress(&mut input, &mut output, cfg.chunk_size, encoder.as_mut())?;
     output.rewind()?;
     let d_perf = decompress(output, Discard::default(), decoder.as_mut())?;
-    let result = BenchmarkResult {
-        cfg,
-        compression: c_perf,
-        decompression: d_perf,
-    };
+    let result = BenchmarkResult::new(cfg, c_perf, d_perf);
     println!("{}", result);
     Ok(result)
 }
 
 fn run_benchmark_many_cmd(cfg: BenchmarkManyCfg) -> anyhow::Result<()> {
+    let mut results = Vec::new();
+    
     for algorithm in cfg.algorithms {
         for level in algorithm.get_compression_levels() {
             let run_cfg = CompressionCfg {
@@ -280,9 +309,18 @@ fn run_benchmark_many_cmd(cfg: BenchmarkManyCfg) -> anyhow::Result<()> {
                 compression: level,
                 chunk_size: cfg.chunk_size,
             };
-            run_benchmark_cmd(run_cfg)?;
+            results.push(run_benchmark_cmd(run_cfg)?);
         }
     }
+    
+    if let Some(path) = cfg.report {
+        let mut writer = csv::Writer::from_path(path)?;
+        for result in results {
+            writer.serialize(&result)?;   
+        }
+        writer.flush()?;
+    }
+    
     Ok(())
 }
 
