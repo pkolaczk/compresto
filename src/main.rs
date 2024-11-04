@@ -141,7 +141,7 @@ impl Algorithm {
             Algorithm::Lz4 => Vec::from_iter((-9..=-1).chain(1..=9)),
             Algorithm::Brotli => Vec::from_iter(1..=8),
             Algorithm::Snappy => vec![0],
-            Algorithm::Lzma => vec![0],
+            Algorithm::Lzma => Vec::from_iter(1..9),
             Algorithm::Lzav => vec![0, 1],
         }
     }
@@ -180,12 +180,12 @@ impl Measurement {
 struct BenchmarkResult {
     algorithm: Algorithm,
     level: i32,
-    uncompressed_len: u64,
-    compressed_len: u64,
+    uncompr_len: u64,
+    compr_len: u64,
     ratio: f64,
     inv_ratio: f64,
-    compression_speed_mpbs: f64,
-    decompression_speed_mpbs: f64,
+    compr_mbps: f64,
+    decompr_mbps: f64,
 }
 
 impl BenchmarkResult {
@@ -193,12 +193,12 @@ impl BenchmarkResult {
         Self {
             algorithm: cfg.algorithm,
             level: cfg.compression,
-            uncompressed_len: compression.input_len,
-            compressed_len: compression.output_len,
+            uncompr_len: compression.input_len,
+            compr_len: compression.output_len,
             ratio: (compression.compression_ratio() * 1000.0).round() / 1000.0,
             inv_ratio: (1.0 / compression.compression_ratio() * 1000.0).round() / 1000.0, 
-            compression_speed_mpbs: (compression.input_throughtput() / 100_000.0).round() / 10.0,
-            decompression_speed_mpbs: (decompression.output_throughtput() / 100_000.0).round() / 10.0,
+            compr_mbps: (compression.input_throughtput() / 100_000.0).round() / 10.0,
+            decompr_mbps: (decompression.output_throughtput() / 100_000.0).round() / 10.0,
         }
     }
 }
@@ -215,12 +215,12 @@ impl Display for BenchmarkResult {
                 .unwrap_or_default()
                 .get_name(),
             self.level,
-            human_bytes(self.uncompressed_len as f64),
-            human_bytes(self.compressed_len as f64),
+            human_bytes(self.uncompr_len as f64),
+            human_bytes(self.compr_len as f64),
             self.ratio * 100.0,
             1.0 / self.ratio,
-            self.compression_speed_mpbs,
-            self.decompression_speed_mpbs
+            self.compr_mbps,
+            self.decompr_mbps
         )
     }
 }
